@@ -43,16 +43,20 @@ async def get_recent_posts(page) -> list[str]:
     """Return up to five recent post texts from the profile page."""
     logging.info(f"Fetching recent posts from {page.url}")
     posts = []
+    valid_count = 0
     try:
         await page.goto(page.url + "recent-activity/all/", wait_until="domcontentloaded", timeout=60000)
         await page.wait_for_timeout(3000)
         elems = await page.locator("div.feed-shared-update-v2").all()
         for el in elems[:5]:
             txt = (await el.inner_text()).strip()
-            posts.append(txt)
+            logging.debug(f"Post snippet: {txt[:60]!r}")
+            if txt:
+                posts.append(txt)
+                valid_count += 1
     except Exception as e:
         logging.warning(f"get_recent_posts error: {e}")
-    logging.info(f"Collected {len(posts)} posts")
+    logging.info(f"Collected {valid_count} valid posts")
     return posts
 
 async def human_delay(min_sec=3, max_sec=7):
@@ -70,8 +74,12 @@ async def classify_extremism(posts: list[str]) -> float:
 
     # Require sufficient post text before calling the language model
     joined = "\n".join(p.strip() for p in posts if p.strip())
+    valid_count = sum(1 for p in posts if p.strip())
+    logging.debug(f"Total characters in posts: {len(joined)}, valid post count: {valid_count}")
+    if joined:
+        logging.debug(f"Post sample for classification: {joined[:80]!r}")
     if len(joined) < 100:
-        logging.info("Not enough post content to evaluate extremism")
+        logging.info(f"Not enough post content to evaluate extremism (len={len(joined)})")
         return 0.0
 
     prompt = (
@@ -94,6 +102,10 @@ async def classify_extremism(posts: list[str]) -> float:
 async def score_profile(page, posts: list[str]) -> int:
     """Score a LinkedIn profile based on its text, connections, and posts."""
     logging.info(f"Scoring profile {page.url}")
+    valid_posts = [p for p in posts if p.strip()]
+    logging.debug(f"Non-empty posts count: {len(valid_posts)}")
+    for sample in valid_posts[:3]:
+        logging.debug(f"Post sample in scoring: {sample[:60]!r}")
     text = ""
     selectors = [
         'section:has(h2:has-text("About")) .inline-show-more-text',
@@ -128,7 +140,9 @@ async def score_profile(page, posts: list[str]) -> int:
         return -10
 
     # Only evaluate extremism if we have ample content
-    if len(text) >= 100 or any(len(p) >= 40 for p in posts):
+    long_posts = [p for p in posts if len(p.strip()) >= 40]
+    logging.debug(f"Posts meeting length threshold: {len(long_posts)}")
+    if len(text) >= 100 or long_posts:
         risk = await classify_extremism(posts)
         if risk >= 0.7:
             return -10
