@@ -6,7 +6,8 @@ import datetime
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright, TimeoutError
 
-logging.basicConfig(level=logging.INFO, format="%(message)s")
+# Enable verbose debug logging so execution progress is visible in the console
+logging.basicConfig(level=logging.DEBUG, format="%(message)s")
 
 # --- Configuration ---
 BRAVE_BROWSER_PATH = os.getenv(
@@ -40,6 +41,7 @@ def contains_any(text: str, keywords: list[str]) -> bool:
 
 async def get_recent_posts(page) -> list[str]:
     """Return up to five recent post texts from the profile page."""
+    logging.info(f"Fetching recent posts from {page.url}")
     posts = []
     try:
         await page.goto(page.url + "recent-activity/all/", wait_until="domcontentloaded", timeout=60000)
@@ -50,6 +52,7 @@ async def get_recent_posts(page) -> list[str]:
             posts.append(txt)
     except Exception as e:
         logging.warning(f"get_recent_posts error: {e}")
+    logging.info(f"Collected {len(posts)} posts")
     return posts
 
 async def human_delay(min_sec=3, max_sec=7):
@@ -63,6 +66,14 @@ async def human_delay(min_sec=3, max_sec=7):
 
 async def classify_extremism(posts: list[str]) -> float:
     """Return an extremism risk score between 0.0 and 1.0."""
+    logging.info("Classifying extremism risk for posts")
+
+    # Require sufficient post text before calling the language model
+    joined = "\n".join(p.strip() for p in posts if p.strip())
+    if len(joined) < 100:
+        logging.info("Not enough post content to evaluate extremism")
+        return 0.0
+
     prompt = (
         f"Evaluate the following LinkedIn posts for extremist/divisive content across: {RISK_TAXONOMY}. "
         "Rate overall risk 0.0–1.0, reply with a single number.\n\nPosts:\n" + "\n---\n".join(posts)
@@ -73,13 +84,16 @@ async def classify_extremism(posts: list[str]) -> float:
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
-        return float(resp.choices[0].message.content.strip())
+        score = float(resp.choices[0].message.content.strip())
+        logging.info(f"Extremism risk score: {score}")
+        return score
     except Exception as e:
         logging.warning(f"classify_extremism parse failed: {e}")
         return 0.0
 
 async def score_profile(page, posts: list[str]) -> int:
     """Score a LinkedIn profile based on its text, connections, and posts."""
+    logging.info(f"Scoring profile {page.url}")
     text = ""
     selectors = [
         'section:has(h2:has-text("About")) .inline-show-more-text',
@@ -112,12 +126,15 @@ async def score_profile(page, posts: list[str]) -> int:
 
     if contains_any(text, KEYWORDS_BLOCK) or any(contains_any(p, KEYWORDS_BLOCK) for p in posts):
         return -10
-    if conn is not None and conn < MIN_CONNECTIONS and not contains_any(text, INSTITUTION_KEYWORDS):
-        return -10
 
-    risk = await classify_extremism(posts)
-    if risk >= 0.7:
-        return -10
+    # Only evaluate extremism if we have ample content
+    if len(text) >= 100 or any(len(p) >= 40 for p in posts):
+        risk = await classify_extremism(posts)
+        if risk >= 0.7:
+            return -10
+    else:
+        logging.info("Insufficient content for extremism check")
+        risk = 0.0
 
     score = 0
     if contains_any(text, INSTITUTION_KEYWORDS):
@@ -126,10 +143,12 @@ async def score_profile(page, posts: list[str]) -> int:
         score += 2
     if conn and conn >= MIN_CONNECTIONS:
         score += 1
+    logging.info(f"Computed score {score}")
     return score
 
 async def process_invitations(context):
     """Process pending invitations using the provided browser context."""
+    logging.info("Starting invitation processing")
     page = await context.new_page()
     page.set_default_navigation_timeout(60000)
     await page.goto(
@@ -146,6 +165,8 @@ async def process_invitations(context):
         return
 
     cards_locator = page.locator(INVITATION_CARD_SELECTOR)
+    count = await cards_locator.count()
+    logging.info(f"Found {count} invitation cards")
     await page.wait_for_timeout(PAGE_WAIT * 1000)
 
     processed = 0
@@ -158,9 +179,11 @@ async def process_invitations(context):
             if processed >= MAX_INVITATIONS:
                 break
 
+            logging.info(f"Processing invitation {processed + 1}")
             link = card.locator('a[href*="/in/"]').first
             href = await link.get_attribute("href")
             profile_url = href if href.startswith("http") else f"https://www.linkedin.com{href}"
+            logging.info(f"Visiting profile {profile_url}")
             new_pg = await context.new_page()
             await new_pg.goto(profile_url, wait_until="domcontentloaded", timeout=60000)
             await new_pg.wait_for_timeout(5000)
@@ -171,27 +194,33 @@ async def process_invitations(context):
             await human_delay()
 
             accept_btn = card.locator('button:has-text("Accept")')
-            if score >= 3 and await accept_btn.count():
+            if score >= 0 and await accept_btn.count():
                 await accept_btn.first.click()
+                logging.info(f"Accepted invitation from {profile_url}")
             else:
                 with open("rejected.txt", "a") as f:
                     f.write(profile_url + "\n")
+                logging.info(f"Rejected invitation from {profile_url} with score {score}")
             processed += 1
             await human_delay()
 
         if processed < MAX_INVITATIONS:
+            logging.info("Reloading invitation manager page")
             await page.reload(wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(PAGE_WAIT * 1000)
     await context.close()
+    logging.info("Finished processing invitations")
 
 async def main():
     """Entry point for running the invitation processor."""
     now = datetime.datetime.now()
     if not (9 <= now.hour < 23):
+        logging.info("Outside active hours, exiting")
         return
 
     profile_dir = os.path.expanduser("~/.config/browseruse/brave-profile")
     async with async_playwright() as p:
+        logging.info("Launching browser context")
         context = await p.chromium.launch_persistent_context(
             executable_path=BRAVE_BROWSER_PATH,
             user_data_dir=profile_dir,
