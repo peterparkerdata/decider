@@ -1,14 +1,22 @@
+import logging
 import asyncio
 import random
-import time
 import os
 import datetime
-from openai import OpenAI
+from openai import AsyncOpenAI
 from playwright.async_api import async_playwright, TimeoutError
 
-# — Configuration —
-OPENAI_API_KEY = "OpenAI API Key"  
-client = OpenAI(api_key=OPENAI_API_KEY)
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+# --- Configuration ---
+BRAVE_BROWSER_PATH = os.getenv(
+    "BRAVE_BROWSER_PATH",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY environment variable not set.")
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 INVITATION_CARD_SELECTOR = 'div[data-view-name="pending-invitation"] div[role="listitem"]'
 KEYWORDS_BLOCK = ["antifa", "blood and soil", "globalist cabal", "white supremacist", "boogaloo"]
@@ -26,12 +34,12 @@ MAX_INVITATIONS = 40
 PAGE_WAIT = 5
 MIN_CONNECTIONS = 50
 
-
 def contains_any(text: str, keywords: list[str]) -> bool:
+    """Return True if any keyword is found in the text."""
     return any(kw.lower() in (text or "").lower() for kw in keywords)
 
-
 async def get_recent_posts(page) -> list[str]:
+    """Return up to five recent post texts from the profile page."""
     posts = []
     try:
         await page.goto(page.url + "recent-activity/all/", wait_until="domcontentloaded", timeout=60000)
@@ -41,41 +49,41 @@ async def get_recent_posts(page) -> list[str]:
             txt = (await el.inner_text()).strip()
             posts.append(txt)
     except Exception as e:
-        print(f"[warn] get_recent_posts error: {e}")
+        logging.warning(f"get_recent_posts error: {e}")
     return posts
 
-
-def human_delay(min_sec=3, max_sec=7):
+async def human_delay(min_sec=3, max_sec=7):
+    """Sleep for a random human-like delay."""
     d = random.uniform(min_sec, max_sec)
     if random.random() < 0.1:
         d = random.uniform(10, 20)
-    print(f"[debug] Sleeping for {d:.1f}s…")
-    time.sleep(d)
-    time.sleep(random.uniform(0.2, 0.8))
-
+    logging.debug(f"Sleeping for {d:.1f}s…")
+    await asyncio.sleep(d)
+    await asyncio.sleep(random.uniform(0.2, 0.8))
 
 async def classify_extremism(posts: list[str]) -> float:
+    """Return an extremism risk score between 0.0 and 1.0."""
     prompt = (
         f"Evaluate the following LinkedIn posts for extremist/divisive content across: {RISK_TAXONOMY}. "
-        "Rate overall risk 0.0–1.0, reply with a single number.\n\nPosts:\n"
-        + "\n---\n".join(posts)
-    )
-    resp = await asyncio.to_thread(
-        client.chat.completions.create,
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        "Rate overall risk 0.0–1.0, reply with a single number.\n\nPosts:\n" + "\n---\n".join(posts)
     )
     try:
+        resp = await client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
         return float(resp.choices[0].message.content.strip())
     except Exception as e:
-        print(f"[warn] classify_extremism parse failed: {e}")
+        logging.warning(f"classify_extremism parse failed: {e}")
         return 0.0
 
-
 async def score_profile(page, posts: list[str]) -> int:
+    """Score a LinkedIn profile based on its text, connections, and posts."""
     text = ""
     selectors = [
+        'section:has(h2:has-text("About")) .inline-show-more-text',
+        'section:has(h2:has-text("About"))',
         "section.pv-about-section",
         ".pv-about__summary-text",
         ".pv-top-card--list-bullet",
@@ -89,18 +97,18 @@ async def score_profile(page, posts: list[str]) -> int:
                 break
         except Exception:
             continue
-    print(f"[debug] Profile text snippet: {text[:80]!r}")
+    logging.debug(f"Profile text snippet: {text[:80]!r}")
 
     conn = None
     try:
         await page.wait_for_selector('span:has-text("connections")', timeout=5000)
         conn_txt = await page.locator('span:has-text("connections")').first.inner_text()
-        print(f"[debug] Raw connection text: {conn_txt!r}")
+        logging.debug(f"Raw connection text: {conn_txt!r}")
         digits = ''.join(c for c in conn_txt if c.isdigit())
         conn = int(digits)
     except Exception:
         pass
-    print(f"[debug] Connection count: {conn}")
+    logging.debug(f"Connection count: {conn}")
 
     if contains_any(text, KEYWORDS_BLOCK) or any(contains_any(p, KEYWORDS_BLOCK) for p in posts):
         return -10
@@ -120,20 +128,20 @@ async def score_profile(page, posts: list[str]) -> int:
         score += 1
     return score
 
-
 async def process_invitations(context):
+    """Process pending invitations using the provided browser context."""
     page = await context.new_page()
     page.set_default_navigation_timeout(60000)
     await page.goto(
         "https://www.linkedin.com/mynetwork/invitation-manager/",
         wait_until="domcontentloaded",
-        timeout=60000
+        timeout=60000,
     )
 
     try:
         await page.wait_for_selector(INVITATION_CARD_SELECTOR, timeout=30000)
     except TimeoutError:
-        print("No invitation cards found")
+        logging.info("No invitation cards found")
         await context.close()
         return
 
@@ -160,7 +168,7 @@ async def process_invitations(context):
             posts = await get_recent_posts(new_pg)
             score = await score_profile(new_pg, posts)
             await new_pg.close()
-            human_delay()
+            await human_delay()
 
             accept_btn = card.locator('button:has-text("Accept")')
             if score >= 3 and await accept_btn.count():
@@ -169,15 +177,15 @@ async def process_invitations(context):
                 with open("rejected.txt", "a") as f:
                     f.write(profile_url + "\n")
             processed += 1
-            human_delay()
+            await human_delay()
 
         if processed < MAX_INVITATIONS:
             await page.reload(wait_until="domcontentloaded", timeout=60000)
             await page.wait_for_timeout(PAGE_WAIT * 1000)
     await context.close()
 
-
 async def main():
+    """Entry point for running the invitation processor."""
     now = datetime.datetime.now()
     if not (9 <= now.hour < 23):
         return
@@ -185,12 +193,11 @@ async def main():
     profile_dir = os.path.expanduser("~/.config/browseruse/brave-profile")
     async with async_playwright() as p:
         context = await p.chromium.launch_persistent_context(
-            executable_path="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            executable_path=BRAVE_BROWSER_PATH,
             user_data_dir=profile_dir,
             headless=False,
         )
         await process_invitations(context)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
