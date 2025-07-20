@@ -5,6 +5,10 @@ import os
 import datetime
 from openai import AsyncOpenAI
 from playwright.async_api import async_playwright, TimeoutError
+from rich.console import Console
+from rich.panel import Panel
+
+console = Console()
 
 # Enable verbose debug logging so execution progress is visible in the console
 logging.basicConfig(level=logging.DEBUG, format="%(message)s")
@@ -211,10 +215,12 @@ async def process_invitations(context):
             if score >= 0 and await accept_btn.count():
                 await accept_btn.first.click()
                 logging.info(f"Accepted invitation from {profile_url}")
+                console.print(Panel(f"Accepted: {profile_url}", style="green"))
             else:
                 with open("rejected.txt", "a") as f:
                     f.write(profile_url + "\n")
                 logging.info(f"Rejected invitation from {profile_url} with score {score}")
+                console.print(Panel(f"Rejected: {profile_url}", style="red"))
             processed += 1
             await human_delay()
 
